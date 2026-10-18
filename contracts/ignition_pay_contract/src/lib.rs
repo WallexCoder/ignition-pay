@@ -958,6 +958,9 @@ impl GovernanceContract {
         env.storage().instance().set(&Symbol::new(&env, "votes_for"), &Map::<u32, i128>::new(&env));
         env.storage().instance().set(&Symbol::new(&env, "votes_against"), &Map::<u32, i128>::new(&env));
         env.storage().instance().set(&Symbol::new(&env, "has_voted"), &Map::<(u32, Address), bool>::new(&env));
+        // CONTRACT-032: per-proposal, per-voter power snapshot.  Populated by
+        // `snapshot_voting_power`; read by `cast_vote`.
+        env.storage().instance().set(&Symbol::new(&env, "vp_snapshot"), &Map::<(u32, Address), i128>::new(&env));
     }
 
     pub fn create_proposal(&self, env: &Env, author: Address, title: String, duration: u64) {
@@ -1018,6 +1021,62 @@ impl GovernanceContract {
         );
     }
 
+    /// CONTRACT-032: Snapshot a voter's governance-token balance for a specific
+    /// proposal.  Must be called while the proposal's voting window is active
+    /// (between `start_time` and `end_time`).  Once stored the snapshot is
+    /// immutable — the first recorded value is kept on subsequent calls, so a
+    /// voter cannot inflate their weight by acquiring tokens after registering.
+    ///
+    /// `cast_vote` will panic if no snapshot has been registered for the
+    /// `(proposal_id, voter)` pair, so voters must call this before voting.
+    pub fn snapshot_voting_power(&self, env: &Env, proposal_id: u32, voter: Address) {
+        voter.require_auth();
+
+        let proposals: Map<u32, Proposal> =
+            env.storage().instance().get(&Symbol::new(&env, "proposals")).unwrap_or_else(|| Map::new(env));
+        let proposal = proposals.get(proposal_id).unwrap_or_else(|| panic!("Proposal not found"));
+
+        let now = env.ledger().timestamp();
+        if now < proposal.start_time || now > proposal.end_time {
+            panic!("Snapshot only allowed during the active voting period");
+        }
+
+        let mut vp_snapshot: Map<(u32, Address), i128> =
+            env.storage().instance().get(&Symbol::new(&env, "vp_snapshot")).unwrap_or_else(|| Map::new(env));
+
+        // Idempotent: keep the first snapshot; ignore subsequent calls.
+        if vp_snapshot.contains_key((proposal_id, voter.clone())) {
+            return;
+        }
+
+        let governance_token: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "governance_token"))
+            .unwrap_or_else(|| panic!("Governance token not set"));
+
+        // Build a Vec<Val> to satisfy invoke_contract's call convention.
+        let mut args = soroban_sdk::Vec::<soroban_sdk::Val>::new(env);
+        args.push_back(voter.clone().to_val());
+        let balance: i128 = env.invoke_contract(&governance_token, &Symbol::new(&env, "balance"), args);
+
+        vp_snapshot.set((proposal_id, voter.clone()), balance);
+        env.storage().instance().set(&Symbol::new(&env, "vp_snapshot"), &vp_snapshot);
+
+        env.events().publish(
+            (Symbol::new(&env, "vp_snapshotted"), &voter),
+            (proposal_id, balance),
+        );
+    }
+
+    /// Return the snapshotted voting power for `voter` on `proposal_id`.
+    /// Returns `None` if `snapshot_voting_power` has not been called yet.
+    pub fn get_voting_power_snapshot(env: Env, proposal_id: u32, voter: Address) -> Option<i128> {
+        let vp_snapshot: Map<(u32, Address), i128> =
+            env.storage().instance().get(&Symbol::new(&env, "vp_snapshot")).unwrap_or_else(|| Map::new(&env));
+        vp_snapshot.get((proposal_id, voter))
+    }
+
     pub fn cast_vote(&self, env: &Env, proposal_id: u32, voter: Address, in_favor: bool) {
         voter.require_auth();
 
@@ -1036,8 +1095,15 @@ impl GovernanceContract {
             panic!("Voter has already voted on this proposal");
         }
 
-        let governance_token: Address = env.storage().instance().get(&Symbol::new(&env, "governance_token")).unwrap();
-        let vote_weight: i128 = env.invoke_contract(&governance_token, &Symbol::new(&env, "balance"), (&voter,));
+        // CONTRACT-032: read the pre-registered snapshot instead of the live
+        // token balance.  A whale who acquires tokens after snapshotting cannot
+        // retroactively increase their weight, closing the last-minute delegation
+        // manipulation vector described in issue #844.
+        let vp_snapshot: Map<(u32, Address), i128> =
+            env.storage().instance().get(&Symbol::new(&env, "vp_snapshot")).unwrap_or_else(|| Map::new(env));
+        let vote_weight: i128 = vp_snapshot
+            .get((proposal_id, voter.clone()))
+            .unwrap_or_else(|| panic!("Voting power not snapshotted: call snapshot_voting_power first"));
 
         if vote_weight <= 0 {
             panic!("Voter has no governance tokens");
@@ -3157,3 +3223,6 @@ impl RefundContract {
         records.get(donation_id).map(|r| r.refunded).unwrap_or(false)
     }
 }
+
+#[cfg(test)]
+mod test;
